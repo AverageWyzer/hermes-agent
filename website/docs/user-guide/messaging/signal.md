@@ -175,11 +175,27 @@ Attachment size limit: **100 MB** (both directions).
 
 Signal messages render with **native formatting** instead of literal markdown characters. The adapter converts markdown (`**bold**`, `*italic*`, `` `code` ``, `~~strike~~`, `||spoiler||`, headings) into Signal `bodyRanges` so the text shows up with real styling on the recipient's client rather than as visible `**` / `` ` `` characters.
 
-**Reply quotes.** When Hermes replies to a specific message, it now posts a native reply that quotes the original — same UI affordance Signal users see when they use "Reply" themselves. This is automatic for replies generated in response to an inbound message.
+**Reply quotes.** When Hermes replies to a specific message, it posts a native reply that quotes the original — same UI affordance Signal users see when they use "Reply" themselves. This is automatic for replies generated in response to an inbound message. Signal identifies a quoted message by its millisecond timestamp, so the adapter only quotes when the inbound id is numeric and otherwise sends a plain message.
 
 **Reactions.** The agent can react to messages via the standard reaction API; reactions surface in Signal as emoji reactions on the referenced message rather than as extra text.
 
 None of this requires additional config — it ships on by default in recent signal-cli builds. If your `signal-cli` version is too old, Hermes falls back to plaintext delivery and logs a one-time warning.
+
+### Buttons and prompts
+
+Signal has **no inline keyboards and no bot API**: nothing can attach a tappable button to a message. The adapter therefore uses Signal's own affordances as buttons and translates the user's tap back into text the agent can read:
+
+| Affordance | When it is used | What the user does |
+|---|---|---|
+| **Poll** | 2–10 options, each ≤ 100 characters | Taps an option in Signal's native poll widget |
+| **Numbered card** | More than 10 options, or long labels | Replies `2`, `2)`, `#2`, `two` — or reacts with the key emoji shown next to the option (1️⃣ 2️⃣ …) |
+| **Emoji key** | Any prompt message | Reacts with the option's emoji |
+
+Every tap is delivered to the agent as one line: `[Signal tap] The user voted “No” in your poll “Deploy?”`, `[Signal tap] The user reacted 2️⃣ on your prompt “Deploy?” → choice: No`, or `[Signal tap] The user replied “2” to your prompt … → choice: “No”`.
+
+Other interactions Signal delivers without a message body are surfaced the same way: `[Signal reaction] …`, `[Signal edit] The user edited a message to: …`, `[Signal delete] …`, `[Signal sticker] …`, `[Signal poll] …` (a poll someone else created).
+
+Signal limits a poll to **10 options** and **100 characters per option**; the adapter rejects nothing itself — `signal-cli` returns a clear error and `send_prompt()` falls back to a numbered card where it can.
 
 ### Long Messages
 
@@ -191,7 +207,7 @@ The bot sends typing indicators while processing messages, refreshing every 8 se
 
 ### Tool Progress Display
 
-Signal does not support editing already-sent messages. Hermes therefore suppresses gateway tool-progress bubbles on Signal, even when `/verbose` is enabled and saves a non-`off` mode for the platform.
+Signal *can* edit a message in place (an edit is a new message carrying `editTimestamp` = the original's timestamp), but the adapter's streaming path deliberately keeps the non-edit path: `send()` returns no editable id and `SUPPORTS_MESSAGE_EDITING` stays off. Code that wants live rewriting can call `send_editable()` then `edit_message()`. Hermes therefore suppresses gateway tool-progress bubbles on Signal, even when `/verbose` is enabled and saves a non-`off` mode for the platform.
 
 You can still see tool activity in the CLI, and final Signal replies can include normal assistant output. If you need live per-tool progress in chat, use a messaging platform with message editing support.
 

@@ -35,6 +35,7 @@ from gateway.platforms.helpers import cancel_task
 from gateway.platforms.media_cache import mime_for_ext
 from tools.audio_container import CONTAINER_TO_EXT, sniff_container
 from plugins.platforms.signal.signal_format import markdown_to_signal
+from plugins.platforms.signal import signal_ui
 from plugins.platforms.signal.signal_rate_limit import (
     SIGNAL_BATCH_PACING_NOTICE_THRESHOLD, SIGNAL_MAX_ATTACHMENTS_PER_MSG, SIGNAL_RATE_LIMIT_MAX_ATTEMPTS,
     SignalRateLimitError, _extract_retry_after_seconds, _format_wait, _is_signal_rate_limit_error,
@@ -222,6 +223,9 @@ class SignalAdapter(BasePlatformAdapter):
         self._recipient_uuid_by_number: dict[str, str] = {}
         self._recipient_number_by_uuid: dict[str, str] = {}
         self._recipient_cache_lock = asyncio.Lock()
+        # Remembers which prompt message/poll is awaiting a tap, so an inbound reaction, poll vote or
+        # numbered reply resolves to the choice the user meant (Signal has no inline buttons).
+        self.prompts = signal_ui.PromptRegistry()
         logger.info("Signal adapter initialized: url=%s account=%s groups=%s", self.http_url,
                     redact_phone(self.account), "enabled" if self.group_allow_from else "disabled")
 
@@ -374,6 +378,71 @@ class SignalAdapter(BasePlatformAdapter):
             return None  # echo of our own outbound reply
         return {**envelope_data, "dataMessage": sent_msg}
 
+    # Envelope keys that carry a button-less "tap" rather than a message body.
+    _INTERACTION_KEYS = ("reactionMessage", "pollVote", "pollCreate", "pollTerminate", "remoteDelete", "sticker")
+
+    def _describe_interaction(self, envelope_data: dict) -> Optional[dict]:
+        """Translate a Signal "tap" into agent-readable text; None when the envelope is not one.
+
+        Signal has no inline buttons, so the user's choices arrive as reactions, poll votes, poll
+        creates/closes, stickers, edits or deletes. Note-to-Self envelopes come in as
+        ``syncMessage.sentMessage`` which :meth:`_unwrap_sync_message` re-homes to ``dataMessage``;
+        a real contact's tap sits at the top level instead, so both locations are checked.
+        Returns ``{"text", "kind", "group_info"}``.
+        """
+        sources = [src for src in (envelope_data, envelope_data.get("dataMessage")) if isinstance(src, dict)]
+        found: dict[str, Any] = {}
+        for src in sources:
+            for key in self._INTERACTION_KEYS + ("editMessage",):
+                if src.get(key):
+                    found.setdefault(key, src[key])
+        if not found:
+            return None
+        group_info = next((src.get("groupInfo") for src in sources if src.get("groupInfo")), None)
+        if group_info is None:
+            # Signal puts groupInfo inside the reaction/vote payload, not on the envelope.
+            group_info = next((v.get("groupInfo") for v in found.values()
+                               if isinstance(v, dict) and v.get("groupInfo")), None)
+        if "reactionMessage" in found:
+            payload = found["reactionMessage"]
+            emoji = payload.get("emoji") or ""
+            resolved = self.prompts.resolve_reaction(payload.get("targetTimestamp"), emoji)
+            return {"kind": "reaction", "group_info": group_info,
+                    "text": signal_ui.describe_reaction(emoji, resolved=resolved,
+                                                        removed=bool(payload.get("isRemove")))}
+        if "pollVote" in found:
+            payload = found["pollVote"]
+            indexes = list(payload.get("optionIndexes") or [])
+            resolved = self.prompts.resolve_vote(payload.get("pollTimestamp"), indexes)
+            return {"kind": "poll_vote", "group_info": group_info,
+                    "text": signal_ui.describe_poll_vote(resolved=resolved, option_indexes=indexes)}
+        if "pollTerminate" in found:
+            payload = found["pollTerminate"]
+            resolved = self.prompts.for_poll(payload.get("pollTimestamp"))
+            return {"kind": "poll_terminate", "group_info": group_info,
+                    "text": signal_ui.describe_poll_terminate(resolved.question if resolved else "")}
+        if "pollCreate" in found:
+            payload = found["pollCreate"]
+            options = [o.get("optionText", "") for o in payload.get("options") or []]
+            self.prompts.register(signal_ui.PendingPrompt(
+                question=payload.get("question", ""),
+                choices=[signal_ui.Choice(label=o) for o in options], kind="poll"),
+                poll_timestamp=payload.get("timestamp"))
+            return {"kind": "poll_create", "group_info": group_info,
+                    "text": signal_ui.describe_poll_create(payload.get("question", ""), options,
+                                                           bool(payload.get("allowMultiple")))}
+        if "remoteDelete" in found:
+            return {"kind": "delete", "group_info": group_info, "text": signal_ui.describe_delete()}
+        if "editMessage" in found:
+            payload = found["editMessage"]
+            new_text = ((payload.get("dataMessage") or {}).get("message") or "").strip()
+            if not new_text:
+                return None
+            return {"kind": "edit", "group_info": group_info, "text": signal_ui.describe_edit(new_text)}
+        payload = found["sticker"]
+        return {"kind": "sticker", "group_info": group_info,
+                "text": signal_ui.describe_sticker(payload.get("emoji") or "")}
+
     def _apply_group_mention_rules(self, text: str, data_message: dict) -> tuple[bool, str]:
         """Gate on require_mention (False = drop) and strip the bot's own @mention from every group
         message, so the agent doesn't read "@+155****4567 say hello" as a directive to contact that number."""
@@ -436,36 +505,51 @@ class SignalAdapter(BasePlatformAdapter):
         # Edited messages carry their updated dataMessage inside editMessage
         data_message = (envelope_data.get("dataMessage")
                         or (envelope_data.get("editMessage") or {}).get("dataMessage"))
-        if not data_message:
+        # Signal has no inline buttons: the user's "clicks" arrive as reactions, poll votes, edits or
+        # deletes (which carry no dataMessage) and as polls/stickers inside a contentless dataMessage.
+        # Translate them into one line of text so the agent sees the tap instead of dropping it.
+        interaction = self._describe_interaction(envelope_data)
+        if not data_message and not interaction:
             return
-        group_info = data_message.get("groupInfo")
+        group_info = (data_message or {}).get("groupInfo") or (interaction or {}).get("group_info")
         group_id = group_info.get("groupId") if group_info else None
         is_group = bool(group_id)
         if is_group and not self._group_allowed(group_id):
             return
         chat_id = f"group:{group_id}" if is_group else sender
-        text = data_message.get("message", "")
-        if text and (mentions := data_message.get("mentions", [])):
-            text = _render_mentions(text, mentions)
-        if is_group:
-            mentioned, text = self._apply_group_mention_rules(text, data_message)
-            if not mentioned:
+        quote_data: dict = {}
+        reply_to_id = reply_to_author = None
+        media_urls: list[str] = []
+        media_types: list[str] = []
+        if interaction:
+            text = interaction["text"]
+        else:
+            if data_message is None:
                 return
-        # quote.id is the quoted message's timestamp, quote.author the quoted sender —
-        # both are preserved so the gateway can tell the agent which message was replied to.
-        quote_data = data_message.get("quote") or {}
-        reply_to_id = str(quote_data.get("id")) if quote_data.get("id") else None
-        reply_to_author = self._extract_quote_author(quote_data)
-        attachments_data = data_message.get("attachments", [])
-        media_urls, media_types = [], []
-        if attachments_data and not getattr(self, "ignore_attachments", False):
-            media_urls, media_types = await self._collect_attachments(attachments_data)
-        # Skip contentless envelopes (profile key updates, empty messages) that still carry a
-        # dataMessage wrapper — otherwise msg='' triggers a full agent turn.
-        if (not text or not text.strip()) and not media_urls:
-            logger.debug("Signal: skipping contentless envelope from %s (%d attachments)", redact_phone(sender),
-                         len(media_urls) if media_urls else 0)
-            return
+            text = data_message.get("message", "")
+            if text and (mentions := data_message.get("mentions", [])):
+                text = _render_mentions(text, mentions)
+            if is_group:
+                mentioned, text = self._apply_group_mention_rules(text, data_message)
+                if not mentioned:
+                    return
+            # quote.id is the quoted message's timestamp, quote.author the quoted sender —
+            # both are preserved so the gateway can tell the agent which message was replied to.
+            quote_data = data_message.get("quote") or {}
+            reply_to_id = str(quote_data.get("id")) if quote_data.get("id") else None
+            reply_to_author = self._extract_quote_author(quote_data)
+            attachments_data = data_message.get("attachments", [])
+            if attachments_data and not getattr(self, "ignore_attachments", False):
+                media_urls, media_types = await self._collect_attachments(attachments_data)
+            # Skip contentless envelopes (profile key updates, empty messages) that still carry a
+            # dataMessage wrapper — otherwise msg='' triggers a full agent turn.
+            if (not text or not text.strip()) and not media_urls:
+                logger.debug("Signal: skipping contentless envelope from %s (%d attachments)", redact_phone(sender),
+                             len(media_urls) if media_urls else 0)
+                return
+            # A bare number is how the user taps a numbered choice card; resolve it to the choice.
+            if text and len(text.strip()) <= 12 and (tap := self.prompts.resolve_text(text)):
+                text = signal_ui.describe_text_choice(tap, text.strip())
         source = self.build_source(
             chat_id=chat_id, chat_name=group_info.get("groupName") if group_info else sender_name,
             chat_type="group" if is_group else "dm", user_id=sender,
@@ -485,7 +569,8 @@ class SignalAdapter(BasePlatformAdapter):
         event = MessageEvent(
             source=source, text=text or "", message_type=msg_type, media_urls=media_urls,
             media_types=media_types, timestamp=timestamp,
-            raw_message={"sender": sender, "timestamp_ms": ts_ms, "quote": quote_data if quote_data else None},
+            raw_message={"sender": sender, "timestamp_ms": ts_ms, "quote": quote_data if quote_data else None,
+                         "interaction": interaction["kind"] if interaction else None},
             reply_to_message_id=reply_to_id, reply_to_text=quote_data.get("text"),
             reply_to_author_id=reply_to_author,
             reply_to_author_name=quote_data.get("authorName") or quote_data.get("authorProfileName"),
@@ -703,6 +788,18 @@ class SignalAdapter(BasePlatformAdapter):
         self._track_sent_timestamp(result)
         return result, None
 
+    def _quote_params(self, chat_id: str, reply_to: Optional[str], metadata: Optional[dict[str, Any]]) -> dict[str, Any]:
+        """Params for a native Signal quote reply. Signal's ``quote.id`` is the quoted message's
+        timestamp in milliseconds, so only numeric ids qualify; anything else falls back to a plain send."""
+        if not reply_to or not str(reply_to).strip().isdigit():
+            return {}
+        params: dict[str, Any] = {"quoteTimestamp": int(str(reply_to).strip()),
+                                  "quoteAuthor": self._account_normalized if chat_id.startswith("group:") else chat_id}
+        quote_text = (metadata or {}).get("reply_to_text")
+        if quote_text:
+            params["quoteMessage"] = str(quote_text)[:500]
+        return params
+
     async def send(self, chat_id: str, content: str, reply_to: Optional[str] = None,
                    metadata: Optional[dict[str, Any]] = None) -> SendResult:
         """Send a text message with native Signal formatting."""
@@ -710,10 +807,12 @@ class SignalAdapter(BasePlatformAdapter):
         if not content or not content.strip():
             return SendResult(success=True, message_id=None)
         base_params = await self._with_target({"account": self.account}, chat_id)
+        # Quote replies: Signal renders them as a native reply bubble, the closest it gets to threading.
+        quote_params = self._quote_params(chat_id, reply_to, metadata)
         chunks = self._split_signal_formatted_message(*markdown_to_signal(content), self.MAX_MESSAGE_LENGTH)
         last_result = None
         for idx, (plain_text, text_styles) in enumerate(chunks, start=1):
-            params: dict[str, Any] = dict(base_params, message=plain_text)
+            params: dict[str, Any] = dict(base_params, message=plain_text, **quote_params)
             if len(text_styles) == 1:
                 params["textStyle"] = text_styles[0]
             elif text_styles:
@@ -725,6 +824,67 @@ class SignalAdapter(BasePlatformAdapter):
                 return err
         # No editable message identifier; message_id=None keeps the stream consumer on the non-edit path.
         return SendResult(success=True, message_id=None, raw_response=last_result)
+
+    async def send_prompt(self, chat_id: str, question: str, choices: list[str | signal_ui.Choice], *,
+                          multi: bool = False, use_poll: bool = True) -> SendResult:
+        """Send a "button" prompt and register it so the user's tap resolves to a choice.
+
+        Signal has no inline keyboard. With 2–10 short options this sends a native **poll** (a real
+        tappable list in Signal's own UI); otherwise it sends a numbered card whose numbers the user
+        types or whose key emoji they react with. Either way the reply is registered in
+        ``self.prompts``, so the inbound side turns the tap into "[Signal tap] … → choice: X".
+        """
+        opts = [c if isinstance(c, signal_ui.Choice) else signal_ui.Choice(label=str(c)) for c in choices]
+        if not opts:
+            return SendResult(success=False, error="send_prompt needs at least one choice")
+        await self._stop_typing_indicator(chat_id)
+        prompt = signal_ui.PendingPrompt(question=question, choices=opts,
+                                         kind="poll" if (use_poll and signal_ui.poll_eligible(opts)) else "card")
+        if prompt.kind == "poll":
+            params = dict(await self._with_target({"account": self.account}, chat_id),
+                          **signal_ui.poll_payload(question, opts, multi=multi))
+            result = await self._rpc("sendPollCreate", params)
+            if result is None:
+                return SendResult(success=False, error="RPC sendPollCreate failed")
+            ts = result.get("timestamp") if isinstance(result, dict) else None
+            self._track_sent_timestamp(result)
+            self.prompts.register(prompt, poll_timestamp=ts)
+            return SendResult(success=True, message_id=str(ts) if ts else None, raw_response=result)
+        text, styles = signal_ui.render_choice_card(question, opts, multi=multi)
+        params = dict(await self._with_target({"account": self.account}, chat_id), message=text)
+        if styles:
+            params["textStyles"] = styles
+        result, err = await self._rpc_send(params, "RPC send failed")
+        if err:
+            return err
+        ts = result.get("timestamp") if isinstance(result, dict) else None
+        self.prompts.register(prompt, message_timestamp=ts)
+        return SendResult(success=True, message_id=str(ts) if ts else None, raw_response=result)
+
+    async def send_editable(self, chat_id: str, content: str) -> SendResult:
+        """Send a message and return its timestamp as ``message_id`` so :meth:`edit_message` can
+        rewrite it later (Signal edits reference the original message timestamp)."""
+        result, err = await self._rpc_send(await self._with_target(
+            {"account": self.account, "message": content}, chat_id), "RPC send failed")
+        if err:
+            return err
+        ts = result.get("timestamp") if isinstance(result, dict) else None
+        return SendResult(success=True, message_id=str(ts) if ts else None, raw_response=result)
+
+    async def edit_message(self, chat_id: str, message_id: str, content: str,
+                           *, finalize: bool = False) -> SendResult:
+        """Edit an already-sent message in place (``editTimestamp`` = the original's ms timestamp)."""
+        if not message_id or not str(message_id).strip().isdigit():
+            return SendResult(success=False,
+                              error="Signal edits need the original message's millisecond timestamp")
+        params = dict(await self._with_target({"account": self.account}, chat_id), message=content,
+                      editTimestamp=int(str(message_id).strip()))
+        result, err = await self._rpc_send(params, "RPC send (edit) failed")
+        return err or SendResult(success=True, message_id=str(message_id), raw_response=result)
+
+    async def add_choice_reaction(self, chat_id: str, emoji: str, target_timestamp: int) -> bool:
+        """React with a key emoji on a prompt message — the visual half of a "button"."""
+        return await self.send_reaction(chat_id, emoji, self._account_normalized, target_timestamp)
 
     def _track_sent_timestamp(self, rpc_result) -> None:
         """Record outbound message timestamp for echo-back filtering."""

@@ -17,6 +17,7 @@ _HEADING_RE = re.compile(r"^#{1,6}\s+", re.MULTILINE)
 _INLINE_PATTERNS = [
     (re.compile(r"\*\*(.+?)\*\*", re.DOTALL), "BOLD"),
     (re.compile(r"__(.+?)__", re.DOTALL), "BOLD"),
+    (re.compile(r"\|\|(.+?)\|\|", re.DOTALL), "SPOILER"),
     (re.compile(r"~~(.+?)~~", re.DOTALL), "STRIKETHROUGH"),
     (re.compile(r"`(.+?)`"), "MONOSPACE"),
     (re.compile(r"(?<!\*)\*(?!\*| )(.+?)(?<!\*)\*(?!\*)"), "ITALIC"),
