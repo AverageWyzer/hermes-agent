@@ -1383,3 +1383,97 @@ class TestRecentSentTimestampRing:
         adapter._track_sent_timestamp({"timestamp": 3})
         # Both 1 and 2 should be evicted on TTL, only 3 remains
         assert list(adapter._recent_sent_timestamps.keys()) == [3]
+
+
+# ---------------------------------------------------------------------------
+# Note-to-Self notification semantics (signal-cli notifySelf)
+# ---------------------------------------------------------------------------
+
+class TestSignalNotifySelf:
+    """A send to the account's own number defaults to a syncMessage, which the phone files under
+    Note to Self as outgoing and never notifies on. notifySelf makes it a normal message."""
+
+    @staticmethod
+    def _capture(adapter):
+        captured = []
+
+        async def mock_rpc(method, params, rpc_id=None, **kwargs):
+            captured.append({"method": method, "params": dict(params)})
+            if method == "send":
+                return {"timestamp": 1700000000000}
+            return None
+
+        adapter._rpc = mock_rpc
+        return captured
+
+    @pytest.mark.asyncio
+    async def test_send_to_own_number_sets_notify_self(self, monkeypatch):
+        adapter = _make_signal_adapter(monkeypatch)
+        adapter._stop_typing_indicator = AsyncMock()
+        captured = self._capture(adapter)
+
+        result = await adapter.send(chat_id=adapter.account, content="hello")
+
+        assert result.success is True
+        sends = [c for c in captured if c["method"] == "send"]
+        assert sends and sends[0]["params"]["notifySelf"] is True
+
+    @pytest.mark.asyncio
+    async def test_send_to_other_recipient_does_not_set_notify_self(self, monkeypatch):
+        adapter = _make_signal_adapter(monkeypatch)
+        adapter._stop_typing_indicator = AsyncMock()
+        captured = self._capture(adapter)
+        other = adapter.account[:-1] + ("0" if adapter.account[-1] != "0" else "1")
+
+        await adapter.send(chat_id=other, content="hello")
+
+        sends = [c for c in captured if c["method"] == "send"]
+        assert sends and "notifySelf" not in sends[0]["params"]
+
+    @pytest.mark.asyncio
+    async def test_send_to_group_does_not_set_notify_self(self, monkeypatch):
+        adapter = _make_signal_adapter(monkeypatch)
+        adapter._stop_typing_indicator = AsyncMock()
+        captured = self._capture(adapter)
+
+        await adapter.send(chat_id="group:abc123", content="hello")
+
+        sends = [c for c in captured if c["method"] == "send"]
+        assert sends and "notifySelf" not in sends[0]["params"]
+
+    @pytest.mark.asyncio
+    async def test_reaction_in_self_chat_sets_notify_self(self, monkeypatch):
+        adapter = _make_signal_adapter(monkeypatch)
+        captured = self._capture(adapter)
+
+        await adapter.send_reaction(adapter.account, "👍", adapter.account, 1700000000000)
+
+        reactions = [c for c in captured if c["method"] == "sendReaction"]
+        assert reactions and reactions[0]["params"]["notifySelf"] is True
+
+
+class TestSelfChatHelper:
+    def test_is_self_chat_matches_own_number(self):
+        from plugins.platforms.signal.self_chat import is_self_chat
+
+        assert is_self_chat("+155****4567", "+155****4567") is True
+
+    def test_is_self_chat_rejects_groups_and_contacts(self):
+        from plugins.platforms.signal.self_chat import is_self_chat
+
+        assert is_self_chat("+155****4567", "group:+155****4567") is False
+        assert is_self_chat("+155****4567", "+155****9999") is False
+        assert is_self_chat("+155****4567", "") is False
+        assert is_self_chat("", "") is False
+
+    def test_set_notify_self_is_idempotent_and_scoped(self):
+        from plugins.platforms.signal.self_chat import set_signal_notify_self
+
+        params = {"account": "+155****4567", "message": "x"}
+        set_signal_notify_self(params, "+155****4567", "+155****4567")
+        set_signal_notify_self(params, "+155****4567", "+155****4567")
+        assert params["notifySelf"] is True
+
+        other = {"message": "x"}
+        set_signal_notify_self(other, "+155****4567", "+155****9999")
+        assert "notifySelf" not in other

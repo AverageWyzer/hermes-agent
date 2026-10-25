@@ -190,12 +190,23 @@ Signal has **no inline keyboards and no bot API**: nothing can attach a tappable
 | **Poll** | 2–10 options, each ≤ 100 characters | Taps an option in Signal's native poll widget |
 | **Numbered card** | More than 10 options, or long labels | Replies `2`, `2)`, `#2`, `two` — or reacts with the key emoji shown next to the option (1️⃣ 2️⃣ …) |
 | **Emoji key** | Any prompt message | Reacts with the option's emoji |
+| **Action link** | Prompts where a tap must be unambiguous (or the choice needs a callback that Signal cannot carry) | Taps the link preview, then a real button on a small mobile page served by the host |
 
 Every tap is delivered to the agent as one line: `[Signal tap] The user voted “No” in your poll “Deploy?”`, `[Signal tap] The user reacted 2️⃣ on your prompt “Deploy?” → choice: No`, or `[Signal tap] The user replied “2” to your prompt … → choice: “No”`.
 
 Other interactions Signal delivers without a message body are surfaced the same way: `[Signal reaction] …`, `[Signal edit] The user edited a message to: …`, `[Signal delete] …`, `[Signal sticker] …`, `[Signal poll] …` (a poll someone else created).
 
 Signal limits a poll to **10 options** and **100 characters per option**; the adapter rejects nothing itself — `signal-cli` returns a clear error and `send_prompt()` falls back to a numbered card where it can.
+
+**Action links** are the one way to get genuinely Telegram-style buttons. Signal cannot host a callback button, but the prompt can carry a link, and the link can open a page whose buttons post the choice back to the machine that asked — a signed, expiring, single-use token per prompt. The page is served by `plugins/platforms/signal/action_links.py` (stdlib, no dependencies); bind it to the tailnet address so only the user's own devices can reach it:
+
+```bash
+ACTION_HOST=100.x.y.z ACTION_PORT=8111 SIGNAL_ACCOUNT=+1555… \
+  python -m plugins.platforms.signal.action_links_demo \
+    --question "Pick a channel:" --choice "Vault note|vault" --choice "Email|email" --send
+```
+
+Each tap is appended to a JSONL store and handed to the `on_choice` hook, so the answer arrives as a signed value rather than text the agent has to parse.
 
 ### Long Messages
 
@@ -227,6 +238,9 @@ Just send a message to yourself from your phone — signal-cli picks it up and H
 - "Note to Self" messages arrive as `syncMessage.sentMessage` envelopes
 - The adapter detects when these are addressed to the bot's own account and processes them as regular inbound messages
 - Echo-back protection (sent-timestamp tracking) prevents infinite loops — the bot's own replies are filtered out automatically
+- Every send to the account's own number carries `notifySelf: true`, so the phone treats the reply as a **normal incoming message** and raises a push notification
+
+**Why `notifySelf` matters:** `signal-cli` sends to your own number as a `syncMessage` by default — the man page for `--note-to-self` describes it as sending without notification. The phone files such a message under Note to Self as an outgoing message it never authored, so replies from the agent arrive **silently**: visible when you open the chat, but no banner, no sound, nothing to tell you an answer landed. With `notifySelf` (the JSON-RPC twin of `--notify-self` on the CLI) signal-cli sends a normal message instead, and the phone alerts on it like any other chat. Direct Note-to-Self chats only; group sends keep their own semantics.
 
 **No extra configuration needed.** This works automatically as long as `SIGNAL_ACCOUNT` matches your phone number.
 

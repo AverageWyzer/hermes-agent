@@ -36,6 +36,7 @@ from gateway.platforms.media_cache import mime_for_ext
 from tools.audio_container import CONTAINER_TO_EXT, sniff_container
 from plugins.platforms.signal.signal_format import markdown_to_signal
 from plugins.platforms.signal import signal_ui
+from plugins.platforms.signal.self_chat import set_signal_notify_self
 from plugins.platforms.signal.signal_rate_limit import (
     SIGNAL_BATCH_PACING_NOTICE_THRESHOLD, SIGNAL_MAX_ATTACHMENTS_PER_MSG, SIGNAL_RATE_LIMIT_MAX_ATTEMPTS,
     SignalRateLimitError, _extract_retry_after_seconds, _format_wait, _is_signal_rate_limit_error,
@@ -659,6 +660,8 @@ class SignalAdapter(BasePlatformAdapter):
             params["groupId"] = chat_id[6:]
         else:
             params["recipient"] = [await self._resolve_recipient(chat_id) if resolve else chat_id]
+            # Note-to-Self replies must arrive as normal messages or the phone never notifies.
+            set_signal_notify_self(params, self.account, chat_id)
         return params
 
     async def _fetch_attachment(self, attachment_id: str) -> tuple:

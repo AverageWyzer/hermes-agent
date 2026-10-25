@@ -7,6 +7,7 @@ import os
 import time
 
 from plugins.platforms.signal import signal_rate_limit as rl
+from plugins.platforms.signal.self_chat import set_signal_notify_self
 from plugins.platforms.signal.signal_format import markdown_to_signal
 from tools.send_message_senders import _error, _success
 
@@ -73,6 +74,8 @@ async def _send_signal(extra, chat_id, message, media_files=None):
 
         async def _rpc_send(text, *, id_prefix, timeout, attachments=None, styled=False):
             params = {"account": account, "message": text, **recipient}
+            # Note-to-Self: a sync message never notifies the phone; ask for a normal message.
+            set_signal_notify_self(params, account, chat_id)
             if styled and text and text_styles:
                 params["textStyle" if len(text_styles) == 1 else "textStyles"] = (
                     text_styles[0] if len(text_styles) == 1 else text_styles)
